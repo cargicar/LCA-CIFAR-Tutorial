@@ -360,7 +360,7 @@ if __name__ == '__main__':
 
     def plot_reconstructions(s, s_hat_soft, s_hat_hard, n_images=4, filename="reconstructions.png", same_T=False):
         def to_image(vec):
-            img = vec.cpu().numpy().reshape(32, 32, 3)
+            img = vec.detach().cpu().numpy().reshape(32, 32, 3)
             img = img - img.min()
             img = img / (img.max() + 1e-8)
             return img

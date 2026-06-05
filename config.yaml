@@ -1,16 +1,16 @@
 data:
   image_glob: "cifar-10-images/*/*.png"
   batch: 32             # images for SLCA/HLCA comparison (sampled once)
-  batch_size: 64        # DataLoader batch size for dictionary learning
+  batch_size: 2048        # DataLoader batch size for dictionary learning
   num_workers: 4
 
 model:
   n_features: 3072        # 32 x 32 x 3 (derived from image size; change if using patches)
-  n_atoms: 5000
-  lam: 0.1
-  tau: 10.0
-  dt: 1.0
-  n_iter: 500
+  n_atoms: 5000           # no lcapt equivalent (flat dict vs conv features)
+  lam: 0.05               # matches config_lcapt lambda_
+  tau: 100                # matches config_lcapt tau
+  dt: 1.0                 # no lcapt equivalent
+  n_iter: 500             # matches config_lcapt lca_iters
 
 inference:
   slca_threshold: "soft"
@@ -19,12 +19,12 @@ inference:
 
 dictionary_learning:
   enabled: true
-  epochs: 25
+  epochs: 12              # matches config_lcapt epochs
   print_freq: 1
-  lambda_anneal_every: 4
+  lambda_anneal_every: 3  # matches config_lcapt lambda_anneal_every
   lambda_anneal_step: 0.1
   threshold: "hard"
-  learning_rate: 0.05
+  learning_rate: 0.01     # matches config_lcapt learning_rate
   n_iter: 500
 
 output:

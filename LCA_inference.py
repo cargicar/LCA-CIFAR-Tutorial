@@ -52,7 +52,7 @@ with open(cfg_path) as f:
 # Experiment directory
 # ---------------------------------------------------------------------------
 
-exp_dir   = os.path.join('experiments', 'inference_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+exp_dir   = os.path.join('experiments', 'LCA_inference_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
 plots_dir = os.path.join(exp_dir, 'plots')
 os.makedirs(plots_dir, exist_ok=True)
 shutil.copy(cfg_path, os.path.join(exp_dir, 'config.yaml'))
@@ -160,14 +160,16 @@ def to_image(vec):
 
 
 n_images = cfg['output']['n_images']
-fig, axes = plt.subplots(n_images, 2, figsize=(4, 2 * n_images))
+fig, axes = plt.subplots(n_images, 3, figsize=(6, 2 * n_images))
 axes[0, 0].set_title("Original")
 axes[0, 1].set_title(f"LCA recon ({threshold})")
+axes[0, 2].set_title("Recon Error")
 for i in range(n_images):
     axes[i, 0].imshow(to_image(s[i]))
-    axes[i, 0].axis('off')
     axes[i, 1].imshow(to_image(s_hat[i]))
-    axes[i, 1].axis('off')
+    axes[i, 2].imshow(to_image(s[i] - s_hat[i]))
+    for ax in axes[i]:
+        ax.axis('off')
 plt.tight_layout()
 out = os.path.join(plots_dir, 'reconstructions.png')
 plt.savefig(out)
