@@ -79,7 +79,7 @@ sys.stderr = _Tee(sys.__stderr__, _log)
 # ---------------------------------------------------------------------------
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-random.seed(42)
+#random.seed(42) #uncomment for reproducibility, but note that some operations are non-deterministic on GPU
 
 print(f"Experiment dir: {exp_dir}")
 print(f"Model:          {pth_path}")

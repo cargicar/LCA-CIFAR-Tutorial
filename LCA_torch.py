@@ -375,7 +375,7 @@ if __name__ == '__main__':
                          filename=os.path.join(plots_dir, "reconstructions_inference.png"))
 
     # ------------------------------------------------------------------ #
-    # 7. (Optional) Dictionary learning demo — tiny example
+    # 7. Dictionary learning demo — tiny example
     # ------------------------------------------------------------------ #
     if learn_dict:
         steps = cfg['dictionary_learning']['steps']
