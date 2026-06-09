@@ -20,10 +20,17 @@ Quick-start
 
     s = torch.randn(16, 64)   # batch of 16 signals
     a, recon = lca(s)         # a: sparse codes (16,128),  recon: (16,64)
+
+Usage — single GPU:
+    python LCA_torch.py [config.yaml]
+
+Usage — N GPUs (e.g. 4):
+    torchrun --nproc_per_node=4 LCA_torch.py [config.yaml]
 """
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from typing import Literal, Tuple
 
 
@@ -226,19 +233,20 @@ if __name__ == '__main__':
     from datetime import datetime
     from PIL import Image
     import numpy as np
-    from torch.utils.data import DataLoader, Dataset
-
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else 'config.yaml'
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
+    from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
     # ------------------------------------------------------------------ #
-    # Experiment directory: experiments/<YYYY-MM-DD_HH-MM-SS>/
+    # DDP helpers
     # ------------------------------------------------------------------ #
-    exp_dir   = os.path.join('experiments', 'LCA_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
-    plots_dir = os.path.join(exp_dir, 'plots')
-    os.makedirs(plots_dir, exist_ok=True)
-    shutil.copy(cfg_path, os.path.join(exp_dir, 'config.yaml'))
+
+    def setup_ddp():
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        return dist.get_rank(), local_rank, dist.get_world_size()
+
+    def cleanup_ddp():
+        dist.destroy_process_group()
 
     class _Tee:
         """Write to multiple streams simultaneously (stdout + log file)."""
@@ -252,27 +260,6 @@ if __name__ == '__main__':
             for f in self.files:
                 f.flush()
 
-    _log = open(os.path.join(exp_dir, 'run.log'), 'w')
-    sys.stdout = _Tee(sys.__stdout__, _log)
-    sys.stderr = _Tee(sys.__stderr__, _log)
-
-    torch.manual_seed(42)
-    random.seed(42)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Experiment dir: {exp_dir}")
-    print(f"Running on {device}  (config: {cfg_path})\n")
-
-    # ------------------------------------------------------------------ #
-    # 1. Load a batch of random CIFAR-10 images as signals
-    #    Each 32x32x3 image is flattened to a vector of length N=3072
-    # ------------------------------------------------------------------ #
-    N          = cfg['model']['n_features']
-    M          = cfg['model']['n_atoms']
-    BATCH      = cfg['data']['batch']
-    niter      = cfg['model']['n_iter']
-    learn_dict = cfg['dictionary_learning']['enabled']
-    learning_rate = cfg['dictionary_learning']['learning_rate']
-
     class _CIFARPNGDataset(Dataset):
         def __init__(self, image_glob):
             self.paths = sorted(glob.glob(image_glob))
@@ -282,203 +269,312 @@ if __name__ == '__main__':
         def __getitem__(self, idx):
             img = Image.open(self.paths[idx]).convert('RGB')
             arr = np.array(img, dtype=np.float32) / 255.0
-            arr = arr - arr.mean()       # zero-mean per image
+            arr = arr - arr.mean()
             return torch.from_numpy(arr.flatten())  # (3072,)
 
-    image_paths = glob.glob(cfg['data']['image_glob'])
-    sampled = random.sample(image_paths, BATCH)
-
-    images = []
-    for path in sampled:
-        img = Image.open(path).convert('RGB')
-        arr = np.array(img, dtype=np.float32) / 255.0   # [0, 1]
-        arr = arr - arr.mean()                            # zero-mean per image
-        images.append(arr.flatten())
-
-    s = torch.tensor(np.stack(images), device=device)    # (BATCH, 3072)
-    print(f"Loaded {BATCH} CIFAR-10 images, signal shape: {s.shape}\n")
-
-    # ------------------------------------------------------------------ #
-    # 2. Build a random overcomplete dictionary
-    # ------------------------------------------------------------------ #
-    Phi = torch.randn(N, M, device=device)
-    Phi = Phi / Phi.norm(dim=0, keepdim=True)   # unit-norm columns
-
-    # ------------------------------------------------------------------ #
-    # 3. Run SLCA (soft threshold)
-    # ------------------------------------------------------------------ #
-    slca = LCA(Phi, lam=cfg['model']['lam'],
-               threshold=cfg['inference']['slca_threshold'],
-               tau=cfg['model']['tau'], n_iter=niter,
-               track_energy=cfg['inference']['track_energy']).to(device)
-    a_soft, s_hat_soft, energies_soft = slca(s)
-
-    print("=== SLCA (soft threshold) ===")
-    print(f"  Sparsity (fraction zero):  {slca.sparsity(a_soft):.3f}")
-    print(f"  Relative recon error:      {slca.reconstruction_error(s, s_hat_soft):.6f}")
-    print(f"  Active coefficients/item:  {(a_soft != 0).float().sum(dim=1).mean():.1f} / {M}")
-    print(f"  Energy (first→last iter):  {energies_soft[0]:.4f} → {energies_soft[-1]:.4f}\n")
-
-    # ------------------------------------------------------------------ #
-    # 4. Run HLCA (hard threshold)
-    # ------------------------------------------------------------------ #
-    hlca = LCA(Phi, lam=cfg['model']['lam'],
-               threshold=cfg['inference']['hlca_threshold'],
-               tau=cfg['model']['tau'], n_iter=niter,
-               track_energy=cfg['inference']['track_energy']).to(device)
-    a_hard, s_hat_hard, energies_hard = hlca(s)
-
-    print("=== HLCA (hard threshold) ===")
-    print(f"  Sparsity (fraction zero):  {hlca.sparsity(a_hard):.3f}")
-    print(f"  Relative recon error:      {hlca.reconstruction_error(s, s_hat_hard):.6f}")
-    print(f"  Active coefficients/item:  {(a_hard != 0).float().sum(dim=1).mean():.1f} / {M}")
-    print(f"  Energy (first→last iter):  {energies_hard[0]:.4f} → {energies_hard[-1]:.4f}\n")
-
-    # ------------------------------------------------------------------ #
-    # 5. Reconstruction error comparison
-    # ------------------------------------------------------------------ #
-    # (Support recovery is skipped: no ground-truth sparse codes for real images)
-    print("=== Reconstruction error comparison ===")
-    print(f"  SLCA relative MSE: {slca.reconstruction_error(s, s_hat_soft):.6f}")
-    print(f"  HLCA relative MSE: {hlca.reconstruction_error(s, s_hat_hard):.6f}")
-    print()
-
-    # ------------------------------------------------------------------ #
-    # 6. Plot original vs reconstructed images
-    # ------------------------------------------------------------------ #
-    import matplotlib.pyplot as plt
-
-    def plot_loss(losses, title="Loss", xlabel="Step", ylabel="MSE", filename="loss.png"):
-        plt.figure()
-        plt.plot(losses)
-        plt.title(title)
-        plt.xlabel(xlabel)
-        plt.ylabel(ylabel)
-        plt.savefig(filename)
-        plt.close()
-        print(f"Saved {filename}")
-
-    def plot_reconstructions(s, s_hat_soft, s_hat_hard, n_images=4, filename="reconstructions.png", same_T=False):
-        def to_image(vec):
-            img = vec.detach().cpu().numpy().reshape(32, 32, 3)
-            img = img - img.min()
-            img = img / (img.max() + 1e-8)
-            return img
-
-        _, axes = plt.subplots(n_images, 3, figsize=(6, 2 * n_images))
-        axes[0, 0].set_title("Original")
-        if same_T:
-            axes[0, 1].set_title("LCA_inference")
-            axes[0, 2].set_title("LCA_dictionary_learning")
+    def main():
+        # ------------------------------------------------------------------ #
+        # Distributed setup
+        # ------------------------------------------------------------------ #
+        using_ddp = dist.is_available() and 'LOCAL_RANK' in os.environ
+        if using_ddp:
+            rank, local_rank, world_size = setup_ddp()
+            device = torch.device(f'cuda:{local_rank}')
         else:
-            axes[0, 1].set_title("SLCA recon")
-            axes[0, 2].set_title("HLCA recon")
+            rank = local_rank = 0
+            world_size = 1
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        for i in range(n_images):
-            for ax, vec in zip(axes[i], [s[i], s_hat_soft[i], s_hat_hard[i]]):
-                ax.imshow(to_image(vec))
-                ax.axis('off')
+        is_main = (rank == 0)
 
-        plt.tight_layout()
-        plt.savefig(filename)
-        plt.close()
-        print(f"Saved {filename}")
+        # ------------------------------------------------------------------ #
+        # Config
+        # ------------------------------------------------------------------ #
+        cfg_path = sys.argv[1] if len(sys.argv) > 1 else 'config.yaml'
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
 
-    plot_reconstructions(s, s_hat_soft, s_hat_hard,
-                         n_images=cfg['output']['n_images'],
-                         filename=os.path.join(plots_dir, "reconstructions_inference.png"))
+        # ------------------------------------------------------------------ #
+        # Experiment directory — rank 0 generates name, broadcasts to all
+        # ------------------------------------------------------------------ #
+        if is_main:
+            exp_dir = os.path.join('experiments', 'LCA_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+        else:
+            exp_dir = None
 
-    # ------------------------------------------------------------------ #
-    # 7. Dictionary learning — full dataset, epoch+batch loop
-    # ------------------------------------------------------------------ #
-    if learn_dict:
-        epochs       = cfg['dictionary_learning']['epochs']
-        print_freq   = cfg['dictionary_learning']['print_freq']
-        anneal_every = cfg['dictionary_learning']['lambda_anneal_every']
-        anneal_step  = cfg['dictionary_learning']['lambda_anneal_step']
+        if using_ddp:
+            container = [exp_dir]
+            dist.broadcast_object_list(container, src=0)
+            exp_dir = container[0]
 
-        print(f"=== Dictionary learning ({epochs} epochs) ===")
+        plots_dir = os.path.join(exp_dir, 'plots')
 
-        lca_dl = LCA(
-            Phi, lam=cfg['model']['lam'],
-            threshold=cfg['dictionary_learning']['threshold'],
-            tau=cfg['model']['tau'],
-            n_iter=cfg['dictionary_learning']['n_iter'],
-            dt=cfg['model']['dt'],
-            dict_lr=learning_rate,
-            learn_dict=True
-        ).to(device)
+        if is_main:
+            os.makedirs(plots_dir, exist_ok=True)
+            shutil.copy(cfg_path, os.path.join(exp_dir, 'config.yaml'))
+            _log = open(os.path.join(exp_dir, 'run.log'), 'w')
+            sys.stdout = _Tee(sys.__stdout__, _log)
+            sys.stderr = _Tee(sys.__stderr__, _log)
 
-        dl_loader = DataLoader(
-            _CIFARPNGDataset(cfg['data']['image_glob']),
-            batch_size=cfg['data']['batch_size'],
-            shuffle=True,
-            num_workers=cfg['data']['num_workers'],
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers=cfg['data']['num_workers'] > 0,
-        )
+        if using_ddp:
+            dist.barrier()
 
-        losses = []
-        lam = cfg['model']['lam']
+        torch.manual_seed(42)
+        random.seed(42)
 
-        for epoch in range(epochs):
-            t0 = time.time()
+        if is_main:
+            print(f"Experiment dir: {exp_dir}")
+            print(f"Device: {device}  GPUs: {world_size}  (config: {cfg_path})\n")
 
-            if epoch > 0 and epoch % anneal_every == 0:
-                lam += anneal_step
-                lca_dl.lam = lam
-                print(f"  [anneal] λ → {lam:.3f}")
+        # ------------------------------------------------------------------ #
+        # 1. Load a batch of random CIFAR-10 images as signals
+        # ------------------------------------------------------------------ #
+        N          = cfg['model']['n_features']
+        M          = cfg['model']['n_atoms']
+        BATCH      = cfg['data']['batch']
+        niter      = cfg['model']['n_iter']
+        learn_dict = cfg['dictionary_learning']['enabled']
+        learning_rate = cfg['dictionary_learning']['learning_rate']
 
-            ep_mse = ep_sparsity = ep_active = ep_rel_err = 0.0
+        image_paths = glob.glob(cfg['data']['image_glob'])
+        sampled = random.sample(image_paths, BATCH)
 
-            for batch_s in dl_loader:
-                batch_s = batch_s.to(device)
-                a_dl, s_hat_dl = lca_dl(batch_s)
-                err = (batch_s - s_hat_dl).pow(2).mean().item()
-                losses.append(err)
+        images = []
+        for path in sampled:
+            img = Image.open(path).convert('RGB')
+            arr = np.array(img, dtype=np.float32) / 255.0
+            arr = arr - arr.mean()
+            images.append(arr.flatten())
 
-                ep_mse      += err
-                ep_sparsity += (a_dl == 0).float().mean().item()
-                ep_active   += (a_dl != 0).float().sum(dim=1).mean().item()
-                ep_rel_err  += err / (batch_s.pow(2).mean().item() + 1e-8)
+        s = torch.tensor(np.stack(images), device=device)
+        if is_main:
+            print(f"Loaded {BATCH} CIFAR-10 images, signal shape: {s.shape}\n")
 
-            nb = len(dl_loader)
-            epoch_time = time.time() - t0
-            print(f"Epoch {epoch:02d} | {epoch_time:.1f}s ({epoch_time/nb:.2f}s/batch) | "
-                  f"Sparsity: {ep_sparsity/nb:.3f}  "
-                  f"Active: {ep_active/nb:.1f}/{M}  "
-                  f"Rel.err: {ep_rel_err/nb:.6f}  "
-                  f"recon MSE: {ep_mse/nb:.6f}  "
-                  f"λ={lam:.3f}")
+        # ------------------------------------------------------------------ #
+        # 2. Build a random overcomplete dictionary
+        # ------------------------------------------------------------------ #
+        Phi = torch.randn(N, M, device=device)
+        Phi = Phi / Phi.norm(dim=0, keepdim=True)
 
-            # checkpoint after each epoch
-            models_dir = os.path.join(exp_dir, 'models')
-            os.makedirs(models_dir, exist_ok=True)
-            torch.save(lca_dl.state_dict(), os.path.join(models_dir, 'lca_dl.pth'))
+        # ------------------------------------------------------------------ #
+        # 3. Run SLCA (soft threshold) — rank 0 only, comparison purposes
+        # ------------------------------------------------------------------ #
+        slca = LCA(Phi, lam=cfg['model']['lam'],
+                   threshold=cfg['inference']['slca_threshold'],
+                   tau=cfg['model']['tau'], n_iter=niter,
+                   track_energy=cfg['inference']['track_energy']).to(device)
+        a_soft, s_hat_soft, energies_soft = slca(s)
 
-        # final summary — run inference on the fixed comparison batch s
-        print(f"\n=== LCA Dictionary Learning ({cfg['dictionary_learning']['threshold']} threshold, λ={lam:.3f}) ===")
-        with torch.no_grad():
-            G = lca_dl.Phi.detach().T @ lca_dl.Phi.detach() - torch.eye(M, device=device)
-        lca_dl.register_buffer('G', G)
-        lca_dl.learn_dict = False
-        a_dl, s_hat_dl = lca_dl(s)
-        print(f"  Sparsity (fraction zero):  {lca_dl.sparsity(a_dl):.3f}")
-        print(f"  Relative recon error:      {lca_dl.reconstruction_error(s, s_hat_dl):.6f}")
-        print(f"  Active coefficients/item:  {(a_dl != 0).float().sum(dim=1).mean():.1f} / {M}")
+        if is_main:
+            print("=== SLCA (soft threshold) ===")
+            print(f"  Sparsity (fraction zero):  {slca.sparsity(a_soft):.3f}")
+            print(f"  Relative recon error:      {slca.reconstruction_error(s, s_hat_soft):.6f}")
+            print(f"  Active coefficients/item:  {(a_soft != 0).float().sum(dim=1).mean():.1f} / {M}")
+            print(f"  Energy (first→last iter):  {energies_soft[0]:.4f} → {energies_soft[-1]:.4f}\n")
 
-        plot_loss(losses, title="Dictionary Learning — Reconstruction MSE",
-                  filename=os.path.join(plots_dir, "dict_learning_loss.png"))
+        # ------------------------------------------------------------------ #
+        # 4. Run HLCA (hard threshold)
+        # ------------------------------------------------------------------ #
+        hlca = LCA(Phi, lam=cfg['model']['lam'],
+                   threshold=cfg['inference']['hlca_threshold'],
+                   tau=cfg['model']['tau'], n_iter=niter,
+                   track_energy=cfg['inference']['track_energy']).to(device)
+        a_hard, s_hat_hard, energies_hard = hlca(s)
 
-        plot_reconstructions(s, s_hat_hard, s_hat_dl,
-                             n_images=cfg['output']['n_images'],
-                             filename=os.path.join(plots_dir, "reconstructions_dictionary_learning.png"),
-                             same_T=True)
+        if is_main:
+            print("=== HLCA (hard threshold) ===")
+            print(f"  Sparsity (fraction zero):  {hlca.sparsity(a_hard):.3f}")
+            print(f"  Relative recon error:      {hlca.reconstruction_error(s, s_hat_hard):.6f}")
+            print(f"  Active coefficients/item:  {(a_hard != 0).float().sum(dim=1).mean():.1f} / {M}")
+            print(f"  Energy (first→last iter):  {energies_hard[0]:.4f} → {energies_hard[-1]:.4f}\n")
 
-        model_path = os.path.join(models_dir, 'lca_dl.pth')
-        print(f"Saved learned dictionary → {model_path}")
+        # ------------------------------------------------------------------ #
+        # 5. Reconstruction error comparison
+        # ------------------------------------------------------------------ #
+        if is_main:
+            print("=== Reconstruction error comparison ===")
+            print(f"  SLCA relative MSE: {slca.reconstruction_error(s, s_hat_soft):.6f}")
+            print(f"  HLCA relative MSE: {hlca.reconstruction_error(s, s_hat_hard):.6f}")
+            print()
 
-    print("\nDone.")
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
-    _log.close()
+        # ------------------------------------------------------------------ #
+        # 6. Plot original vs reconstructed images
+        # ------------------------------------------------------------------ #
+        import matplotlib.pyplot as plt
+
+        def plot_loss(losses, title="Loss", xlabel="Step", ylabel="MSE", filename="loss.png"):
+            plt.figure()
+            plt.plot(losses)
+            plt.title(title)
+            plt.xlabel(xlabel)
+            plt.ylabel(ylabel)
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved {filename}")
+
+        def plot_reconstructions(s, s_hat_soft, s_hat_hard, n_images=4, filename="reconstructions.png", same_T=False):
+            def to_image(vec):
+                img = vec.detach().cpu().numpy().reshape(32, 32, 3)
+                img = img - img.min()
+                img = img / (img.max() + 1e-8)
+                return img
+
+            _, axes = plt.subplots(n_images, 3, figsize=(6, 2 * n_images))
+            axes[0, 0].set_title("Original")
+            if same_T:
+                axes[0, 1].set_title("LCA_inference")
+                axes[0, 2].set_title("LCA_dictionary_learning")
+            else:
+                axes[0, 1].set_title("SLCA recon")
+                axes[0, 2].set_title("HLCA recon")
+
+            for i in range(n_images):
+                for ax, vec in zip(axes[i], [s[i], s_hat_soft[i], s_hat_hard[i]]):
+                    ax.imshow(to_image(vec))
+                    ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved {filename}")
+
+        if is_main:
+            plot_reconstructions(s, s_hat_soft, s_hat_hard,
+                                 n_images=cfg['output']['n_images'],
+                                 filename=os.path.join(plots_dir, "reconstructions_inference.png"))
+
+        # ------------------------------------------------------------------ #
+        # 7. Dictionary learning — full dataset, epoch+batch loop
+        # ------------------------------------------------------------------ #
+        if learn_dict:
+            epochs       = cfg['dictionary_learning']['epochs']
+            print_freq   = cfg['dictionary_learning']['print_freq']
+            anneal_every = cfg['dictionary_learning']['lambda_anneal_every']
+            anneal_step  = cfg['dictionary_learning']['lambda_anneal_step']
+
+            if is_main:
+                print(f"=== Dictionary learning ({epochs} epochs, {world_size} GPU(s)) ===")
+                print(f"    effective batch = {cfg['data']['batch_size']} × {world_size} = "
+                      f"{cfg['data']['batch_size'] * world_size}\n")
+
+            lca_dl = LCA(
+                Phi, lam=cfg['model']['lam'],
+                threshold=cfg['dictionary_learning']['threshold'],
+                tau=cfg['model']['tau'],
+                n_iter=cfg['dictionary_learning']['n_iter'],
+                dt=cfg['model']['dt'],
+                dict_lr=learning_rate,
+                learn_dict=True
+            ).to(device)
+
+            # All ranks must start with identical weights.
+            # _forward_with_learning uses backprop + manual update (not DDP),
+            # so we keep replicas in sync with manual all_reduce after each batch.
+            if using_ddp:
+                dist.broadcast(lca_dl.Phi.data, src=0)
+
+            dset = _CIFARPNGDataset(cfg['data']['image_glob'])
+            sampler = (
+                DistributedSampler(dset, num_replicas=world_size, rank=rank, shuffle=True)
+                if using_ddp else None
+            )
+            dl_loader = DataLoader(
+                dset,
+                batch_size=cfg['data']['batch_size'],
+                shuffle=(sampler is None),
+                sampler=sampler,
+                num_workers=cfg['data']['num_workers'],
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=cfg['data']['num_workers'] > 0,
+            )
+
+            losses = []
+            lam = cfg['model']['lam']
+
+            for epoch in range(epochs):
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
+
+                t0 = time.time()
+
+                if epoch > 0 and epoch % anneal_every == 0:
+                    lam += anneal_step
+                    lca_dl.lam = lam
+                    if is_main:
+                        print(f"  [anneal] λ → {lam:.3f}")
+
+                ep_mse = ep_sparsity = ep_active = ep_rel_err = 0.0
+
+                for batch_s in dl_loader:
+                    batch_s = batch_s.to(device)
+                    a_dl, s_hat_dl = lca_dl(batch_s)
+                    err = (batch_s - s_hat_dl).pow(2).mean().item()
+
+                    # Each rank has applied its own gradient update to Phi.
+                    # Average the updated weights across all GPUs, then
+                    # re-normalise (mean of unit-norm vectors is not unit-norm).
+                    if using_ddp:
+                        dist.all_reduce(lca_dl.Phi.data, op=dist.ReduceOp.SUM)
+                        lca_dl.Phi.data /= world_size
+                        lca_dl._normalise_dict()
+
+                    if is_main:
+                        losses.append(err)
+
+                    ep_mse      += err
+                    ep_sparsity += (a_dl == 0).float().mean().item()
+                    ep_active   += (a_dl != 0).float().sum(dim=1).mean().item()
+                    ep_rel_err  += err / (batch_s.pow(2).mean().item() + 1e-8)
+
+                nb = len(dl_loader)
+                epoch_time = time.time() - t0
+
+                if is_main:
+                    print(f"Epoch {epoch:02d} | {epoch_time:.1f}s ({epoch_time/nb:.2f}s/batch) | "
+                          f"Sparsity: {ep_sparsity/nb:.3f}  "
+                          f"Active: {ep_active/nb:.1f}/{M}  "
+                          f"Rel.err: {ep_rel_err/nb:.6f}  "
+                          f"recon MSE: {ep_mse/nb:.6f}  "
+                          f"λ={lam:.3f}")
+
+                    models_dir = os.path.join(exp_dir, 'models')
+                    os.makedirs(models_dir, exist_ok=True)
+                    torch.save(lca_dl.state_dict(), os.path.join(models_dir, 'lca_dl.pth'))
+
+            # Final summary — run inference on the fixed comparison batch s
+            if is_main:
+                print(f"\n=== LCA Dictionary Learning "
+                      f"({cfg['dictionary_learning']['threshold']} threshold, λ={lam:.3f}) ===")
+
+            with torch.no_grad():
+                G = lca_dl.Phi.detach().T @ lca_dl.Phi.detach() - torch.eye(M, device=device)
+            lca_dl.register_buffer('G', G)
+            lca_dl.learn_dict = False
+            a_dl, s_hat_dl = lca_dl(s)
+
+            if is_main:
+                print(f"  Sparsity (fraction zero):  {lca_dl.sparsity(a_dl):.3f}")
+                print(f"  Relative recon error:      {lca_dl.reconstruction_error(s, s_hat_dl):.6f}")
+                print(f"  Active coefficients/item:  {(a_dl != 0).float().sum(dim=1).mean():.1f} / {M}")
+
+                plot_loss(losses, title="Dictionary Learning — Reconstruction MSE",
+                          filename=os.path.join(plots_dir, "dict_learning_loss.png"))
+
+                plot_reconstructions(s, s_hat_hard, s_hat_dl,
+                                     n_images=cfg['output']['n_images'],
+                                     filename=os.path.join(plots_dir, "reconstructions_dictionary_learning.png"),
+                                     same_T=True)
+
+                model_path = os.path.join(models_dir, 'lca_dl.pth')
+                print(f"Saved learned dictionary → {model_path}")
+
+        if is_main:
+            print("\nDone.")
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            _log.close()
+
+        if using_ddp:
+            cleanup_ddp()
+
+    main()

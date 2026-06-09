@@ -1,13 +1,13 @@
 data:
   image_glob: "cifar-10-images/*/*.png"   # local CIFAR-10 PNGs
-  batch_size: 2048
+  batch_size: 16384
   num_workers: 4
 
 model:
   features: 64                # number of dictionary atoms
   in_channels: 3              # RGB
-  kernel_size: 9              # spatial size of each atom (9x9)
-  stride: 2
+  kernel_size: 8              # spatial size of each atom (9x9)
+  stride: 8
   lambda_: 0.1               # LCA firing threshold
   tau: 100                    # LCA time constant
   lca_iters: 500              # ODE steps per forward pass
@@ -16,7 +16,7 @@ model:
 training:
   epochs: 12
   lambda_anneal_every: 3      # increase lambda_ by lambda_anneal_step every N epochs
-  lambda_anneal_step: 0.1
+  lambda_anneal_step: 0.05
   print_freq: 20              # print metrics every N batches
   dtype: "float32"            # float16 overflows during the 500-iter LCA ODE; use float32 or bfloat16
 
