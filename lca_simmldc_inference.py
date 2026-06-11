@@ -394,20 +394,41 @@ nonzero_pct = 100.0 * vstats['active_total'] / vstats['code_total']
 print(f"  Non-zero fraction:          {nonzero_pct:.2f}%")
 print()
 
-# Compression analysis
+# ---------------------------------------------------------------------------
+# Compression metrics
+# ---------------------------------------------------------------------------
 voxels    = D * H * W
-bytes_in  = voxels * 4                                    # float32 original
-n_nonzero = vstats['active_total']
-feat_bits  = int(np.ceil(np.log2(mcfg['features'] + 1)))
-coord_bits = int(np.ceil(np.log2(D // dcfg['patch_size'] *
-                                  (dcfg['patch_size'] // mcfg['stride'])**3 + 1)))
-bytes_sparse = n_nonzero * (4 + (feat_bits + 3 * coord_bits + 7) // 8)
-print(f"  Input size  (float32):     {bytes_in/1024:.1f} KB")
-print(f"  Sparse code (est.):        {bytes_sparse/1024:.1f} KB")
-if bytes_sparse < bytes_in:
-    print(f"  Compression ratio:         {bytes_in/bytes_sparse:.2f}×")
-else:
-    print(f"  No compression at this sparsity level")
+bytes_in  = voxels * 4          # raw float32
+
+# Sparse COO storage: each non-zero = float32 value (4 bytes) + flat index.
+# Index addresses the full code tensor:
+#   features × (D/P) × (H/P) × (W/P) × (P/stride)³ positions
+n_code_positions = (mcfg['features'] *
+                    (D // dcfg['patch_size']) *
+                    (H // dcfg['patch_size']) *
+                    (W // dcfg['patch_size']) *
+                    (dcfg['patch_size'] // mcfg['stride'])**3)
+index_bits   = int(np.ceil(np.log2(n_code_positions + 1)))
+bytes_per_nz = 4 + (index_bits + 7) // 8      # value + index
+n_nonzero    = vstats['active_total']
+bytes_sparse = n_nonzero * bytes_per_nz
+
+# Quality metrics
+rmse         = float(np.sqrt((error_vol**2).mean()))
+signal_range = float(input_vol.max() - input_vol.min())
+psnr         = float(20 * np.log10(signal_range / (rmse + 1e-12)))
+bpv          = (bytes_sparse * 8) / voxels
+comp_ratio   = bytes_in / bytes_sparse if bytes_sparse > 0 else float('inf')
+
+print(f"  --- Compression metrics ---")
+print(f"  Input size      (float32):  {bytes_in/1024:.1f} KB")
+print(f"  Sparse code     (est.):     {bytes_sparse/1024:.1f} KB  "
+      f"({index_bits}-bit index + 32-bit value per non-zero)")
+print(f"  Compression ratio:          {comp_ratio:.2f}×")
+print(f"  Bits per voxel  (BPV):      {bpv:.3f}  (baseline = 32 bpv)")
+print(f"  RMSE:                       {rmse:.6f}")
+print(f"  PSNR:                       {psnr:.2f} dB")
+print(f"  Relative L2 error:          {vstats['rel_err']:.6f}")
 print()
 
 # Plot 4 — full-volume mid-plane slices

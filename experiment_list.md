@@ -10,6 +10,8 @@ We take a single shop from a single simulation and do a few forward passes to op
 - **Dictionary atom plots**: 3D kernels are visualized as their central depth slice (`kD//2`), the standard way to display 3D filters.
 - **`patch_size=32`, `stride=4`**: Output code is `(32/4)³ = 8³ = 512` positions/patch with 64 atoms → 32,768 total code values per patch.
 - **LCAConv3D**: Same API as LCAConv2D but takes `(B, C, D, H, W)` input. Multi-GPU sync via manual `all_reduce` after each Hebbian update, identical to the CIFAR pipeline.
+- **Full-volume reconstruction**: The inference script tiles the 128³ volume into non-overlapping 32³ patches (4×4×4 = 64 tiles), runs LCA on each batch, then undoes LCA's per-patch normalization (`recon_global = recon_lca × patch_std + patch_mean`) before stitching back to 128³. Tile-boundary discontinuities are visible as a faint grid artifact in the reconstruction.
+- **Compression metrics**: Sparse COO storage assigns each non-zero a float32 value (4 bytes) + a flat index into the full code tensor of `features × (D/P) × (H/P) × (W/P) × (P/stride)³` positions. With 2,097,152 addressable positions, each index costs 22 bits (3 bytes), giving 7 bytes per non-zero. Standard quality/rate metrics reported: PSNR (dB), RMSE, bits-per-voxel (BPV, baseline = 32), and compression ratio vs raw float32.
 
 ### Results
 **Experiment:** `simmldc_2026-06-11_13-28-15`  
