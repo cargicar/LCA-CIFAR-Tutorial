@@ -1,0 +1,29 @@
+data:
+  h5_path:   "/data/mldc/jhtdb/iso_pressure_n128_nt32_s1.h5"
+  field_key: "pressure"
+  timestep:  15          # index into the nt dimension (0-based → physical t=16)
+  patch_size: 32         # 3D patch side length; must be divisible by stride
+  n_patches:  2000       # virtual epoch size (random crops per epoch)
+  batch_size: 16
+  num_workers: 4
+
+model:
+  features:     64
+  in_channels:  1        # scalar field (pressure)
+  kernel_size:  7        # must be odd
+  stride:       4        # output: (32/4)³ = 8³ = 512 code positions/patch
+  lambda_:      0.05
+  tau:          100
+  lca_iters:    500
+  learning_rate: 0.005
+
+training:
+  epochs: 55
+  lambda_anneal_start: 15
+  lambda_anneal_stop:  40
+  lambda_anneal_every: 1
+  lambda_anneal_step:  0.02
+  dtype: "float32"
+
+output:
+  n_images: 4
